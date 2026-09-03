@@ -1,3 +1,4 @@
 opencv-python
 websocket-client
 python-dotenv
+numpy

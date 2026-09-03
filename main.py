@@ -5,29 +5,27 @@ resultado do reconhecimento (nome + confiança) desenhados sobre cada rosto dete
 
 Protocolo (ver api/routes/websocket.py): a cada frame JPEG binário enviado, o servidor
 responde com um único JSON {"faces": [...]} antes do próximo frame poder ser enviado --
-por isso o laço abaixo é estritamente send/recv em série, sem overlap.
+por isso o envio para o servidor é estritamente send/recv em série, sem overlap. Como o
+processamento no servidor é bem mais lento que a captura de câmera, esse laço de
+rede roda numa thread separada (recognition_worker) alimentada sempre com o frame mais
+recente (latest_frame), enquanto a thread principal exibe a câmera ao vivo sem esperar
+pela rede -- as caixas desenhadas usam o último resultado recebido (latest_faces), que
+pode estar um pouco atrasado em relação ao frame exibido, mas sem travar o preview.
 """
 import json
 import os
+import threading
 import time
 
 import cv2
 import websocket
 from dotenv import load_dotenv
 
-try:
-    from picamera2 import Picamera2
-    HAS_PICAMERA2 = True
-except ImportError:
-    HAS_PICAMERA2 = False
+from camera import create_camera
 
 load_dotenv()
 
 SERVER_WS_URL = os.getenv('SERVER_WS_URL', 'ws://localhost:5000/ws/recognize')
-CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
-CAMERA_BACKEND = os.getenv('CAMERA_BACKEND', 'auto')  # 'auto', 'picamera2' ou 'opencv'
-CAMERA_WIDTH = int(os.getenv('CAMERA_WIDTH', '640'))
-CAMERA_HEIGHT = int(os.getenv('CAMERA_HEIGHT', '480'))
 JPEG_QUALITY = int(os.getenv('JPEG_QUALITY', '80'))
 RECONNECT_DELAY_SECONDS = 2
 
@@ -53,92 +51,85 @@ def draw_faces(frame, faces):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
 
-class OpenCVCamera:
-    """Câmera via OpenCV/V4L2 -- webcams USB ou stack de câmera legada do Raspberry Pi."""
+class LatestValue:
+    """Guarda só o valor mais recente escrito, descartando os anteriores -- usado para
+    passar frames/resultados entre a thread de captura/exibição e a de rede sem que uma
+    espere a outra."""
 
-    def __init__(self, index):
-        self.cap = cv2.VideoCapture(index)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Não foi possível abrir a câmera (index={index})")
+    def __init__(self, initial=None):
+        self._lock = threading.Lock()
+        self._value = initial
 
-    def read(self):
-        return self.cap.read()
+    def set(self, value):
+        with self._lock:
+            self._value = value
 
-    def release(self):
-        self.cap.release()
-
-
-class Picamera2Camera:
-    """Câmera via Picamera2/libcamera -- módulo de câmera CSI do Raspberry Pi (Bullseye/Bookworm)."""
-
-    def __init__(self, width, height):
-        self.picam2 = Picamera2()
-        config = self.picam2.create_video_configuration(main={"format": "BGR888", "size": (width, height)})
-        self.picam2.configure(config)
-        self.picam2.start()
-
-    def read(self):
-        return True, self.picam2.capture_array()
-
-    def release(self):
-        self.picam2.stop()
-        self.picam2.close()
+    def get(self):
+        with self._lock:
+            return self._value
 
 
-def create_camera():
-    backend = CAMERA_BACKEND
-    if backend == 'auto':
-        backend = 'picamera2' if HAS_PICAMERA2 else 'opencv'
+def recognition_worker(latest_frame, latest_faces, stop_event):
+    """Roda em thread separada: mantém a conexão WebSocket com o servidor e, em loop,
+    envia sempre o frame mais recente disponível (latest_frame) e atualiza o resultado
+    mais recente (latest_faces) assim que a resposta chega. Nunca acumula frames
+    atrasados -- se o servidor demorar, o próximo envio já pega o frame mais novo."""
+    while not stop_event.is_set():
+        ws = None
+        try:
+            print(f"Conectando em {SERVER_WS_URL}...")
+            ws = websocket.create_connection(SERVER_WS_URL, timeout=5)
+            print("Conectado.")
 
-    if backend == 'picamera2':
-        if not HAS_PICAMERA2:
-            raise RuntimeError(
-                "CAMERA_BACKEND=picamera2, mas o pacote picamera2 não está instalado. "
-                "Instale com 'sudo apt install -y python3-picamera2' (recriando o venv com "
-                "--system-site-packages) ou defina CAMERA_BACKEND=opencv."
-            )
-        print("Usando backend de câmera: picamera2 (libcamera)")
-        return Picamera2Camera(CAMERA_WIDTH, CAMERA_HEIGHT)
+            while not stop_event.is_set():
+                frame = latest_frame.get()
+                if frame is None:
+                    time.sleep(0.01)
+                    continue
 
-    print(f"Usando backend de câmera: OpenCV (index={CAMERA_INDEX})")
-    return OpenCVCamera(CAMERA_INDEX)
+                ok, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+                if not ok:
+                    continue
+
+                ws.send_binary(buffer.tobytes())
+                response = json.loads(ws.recv())
+                latest_faces.set(response.get('faces', []))
+        except (websocket.WebSocketException, ConnectionError, OSError) as e:
+            print(f"Conexão com o servidor perdida ({e}). Reconectando em {RECONNECT_DELAY_SECONDS}s...")
+            time.sleep(RECONNECT_DELAY_SECONDS)
+        finally:
+            if ws is not None:
+                ws.close()
 
 
 def run():
     cap = create_camera()
+    latest_frame = LatestValue(None)
+    latest_faces = LatestValue([])
+    stop_event = threading.Event()
+
+    worker = threading.Thread(
+        target=recognition_worker,
+        args=(latest_frame, latest_faces, stop_event),
+        daemon=True,
+    )
+    worker.start()
 
     try:
         while True:
-            ws = None
-            try:
-                print(f"Conectando em {SERVER_WS_URL}...")
-                ws = websocket.create_connection(SERVER_WS_URL, timeout=5)
-                print("Conectado.")
+            ret, frame = cap.read()
+            if not ret:
+                print("Falha ao capturar frame da câmera.")
+                continue
 
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        print("Falha ao capturar frame da câmera.")
-                        break
+            latest_frame.set(frame.copy())
 
-                    ok, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-                    if not ok:
-                        continue
-
-                    ws.send_binary(buffer.tobytes())
-                    response = json.loads(ws.recv())
-                    draw_faces(frame, response.get('faces', []))
-
-                    cv2.imshow('Smart Glasses - Evaluation', frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        return
-            except (websocket.WebSocketException, ConnectionError, OSError) as e:
-                print(f"Conexão com o servidor perdida ({e}). Reconectando em {RECONNECT_DELAY_SECONDS}s...")
-                time.sleep(RECONNECT_DELAY_SECONDS)
-            finally:
-                if ws is not None:
-                    ws.close()
+            draw_faces(frame, latest_faces.get())
+            cv2.imshow('Smart Glasses - Evaluation', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                return
     finally:
+        stop_event.set()
         cap.release()
         cv2.destroyAllWindows()
 

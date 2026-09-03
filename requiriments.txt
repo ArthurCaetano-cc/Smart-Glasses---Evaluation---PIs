@@ -1,4 +1,5 @@
-opencv-python
+opencv_python
 websocket-client
+requests
 python-dotenv
-numpy
+numpy<2.0

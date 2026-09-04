@@ -1,5 +1,4 @@
 opencv_python
-websocket-client
-requests
+websockets
 python-dotenv
 numpy<2.0
